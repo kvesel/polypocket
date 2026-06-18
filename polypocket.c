@@ -1,9 +1,9 @@
 /*
- * polypocket.c — polyglot file builder for PDF, JPEG, and ZIP
+ * polypocket.c — polyglot file builder for PDF, JPEG, ZIP, and ELF
  *
  * Usage: polypocket output input1 input2 [input3]
  * Builds a single output file that is simultaneously valid in all
- * supplied formats (any combination of pdf/jpeg/zip).
+ * supplied formats (any combination of pdf/jpeg/zip/elf).
  *
  * Compile: cc -O2 -o polypocket polypocket.c
  */
@@ -27,7 +27,7 @@ static void die(const char *fmt, ...) {
     exit(1);
 }
 
-typedef enum { FT_PDF, FT_JPEG, FT_ZIP } FileType;
+typedef enum { FT_PDF, FT_JPEG, FT_ZIP, FT_ELF } FileType;
 
 typedef struct { uint8_t *data; size_t size; } File;
 
@@ -113,6 +113,8 @@ static FileType detect_type(const File *f, const char *name) {
         return FT_JPEG;
     if (f->size >= 4 && memcmp(f->data, "PK\x03\x04", 4) == 0)
         return FT_ZIP;
+    if (f->size >= 4 && memcmp(f->data, "\x7f" "ELF", 4) == 0)
+        return FT_ELF;
     size_t scan = f->size < 1024 ? f->size : 1024;
     for (size_t i = 0; i + 4 <= scan; i++)
         if (memcmp(f->data + i, "%PDF", 4) == 0) return FT_PDF;
@@ -402,6 +404,75 @@ static Buf combine_all(const File *jpeg, const File *pdf, const File *zip) {
     return out;
 }
 
+/* ── ELF combinations ───────────────────────────────────────────── */
+
+/*
+ * ELF+ZIP: the kernel only loads PT_LOAD segments and ignores trailing
+ * bytes, so we can append a ZIP just like we do after a JPEG or PDF.
+ */
+static Buf combine_elf_zip(const File *elf, const File *zip) {
+    Buf out; buf_init(&out);
+    buf_append(&out, elf->data, elf->size);
+    Buf zp = zip_with_delta(zip, elf->size);
+    buf_append(&out, zp.data, zp.len);
+    buf_free(&zp);
+    return out;
+}
+
+/*
+ * ELF+PDF: smuggle %PDF into ELF ident bytes [8..15].
+ *
+ * The ELF ident is 16 bytes: magic[4] class data version osabi
+ * abiversion[1] pad[7].  The Linux kernel ignores bytes 8-15
+ * (EI_ABIVERSION + EI_PAD) entirely, so we can overwrite them without
+ * breaking execution.
+ *
+ * We place the first 8 bytes of the PDF header ("%PDF-1.7") there,
+ * dropping only the trailing newline.  The rest of the PDF (from byte M
+ * onward, where M = length of the first line including "\n") is appended
+ * after the ELF.
+ *
+ * Object at original PDF offset O lands at (elf->size + O - M) in the
+ * output, so delta = elf->size - M.
+ */
+static Buf combine_elf_pdf(const File *elf, const File *pdf) {
+    if (elf->size < 16)
+        die("ELF: file too small to patch ident");
+    if (pdf->size < 5 || memcmp(pdf->data, "%PDF-", 5) != 0)
+        die("PDF: file does not start with %%PDF-");
+
+    size_t M = 0;
+    while (M < pdf->size && pdf->data[M] != '\n') M++;
+    if (M < pdf->size) M++;   /* include the \n in the stripped prefix */
+    if (M < 5)
+        die("PDF: header line too short");
+
+    size_t delta = elf->size - M;
+
+    Buf out; buf_init(&out);
+    buf_append(&out, elf->data, elf->size);
+    /* patch ident[8..15] with first 8 bytes of PDF header (no \n) */
+    size_t patch = (M - 1) < 8 ? (M - 1) : 8;
+    memcpy(out.data + 8, pdf->data, patch);
+    if (patch < 8) memset(out.data + 8 + patch, 0, 8 - patch);
+
+    Buf pmod = pdf_with_delta(pdf, delta, M);
+    buf_append(&out, pmod.data, pmod.len);
+    buf_free(&pmod);
+    return out;
+}
+
+static Buf combine_elf_pdf_zip(const File *elf, const File *pdf, const File *zip) {
+    Buf ep = combine_elf_pdf(elf, pdf);
+    Buf zp = zip_with_delta(zip, ep.len);
+    Buf out; buf_init(&out);
+    buf_append(&out, ep.data, ep.len);
+    buf_append(&out, zp.data, zp.len);
+    buf_free(&ep);
+    buf_free(&zp);
+    return out;
+}
+
 /* ── main ───────────────────────────────────────────────────────── */
 
 int main(int argc, char *argv[]) {
@@ -409,7 +480,8 @@ int main(int argc, char *argv[]) {
         fprintf(stderr,
             "usage: polypocket <output> <file1> <file2> [file3]\n"
             "  builds a polyglot file valid in all supplied formats\n"
-            "  supported types: pdf, jpeg/jpg, zip\n");
+            "  supported types: pdf, jpeg/jpg, zip, elf\n"
+            "  note: elf cannot be combined with jpeg (both require magic at byte 0)\n");
         return 1;
     }
 
@@ -428,23 +500,31 @@ int main(int argc, char *argv[]) {
             if (types[i] == types[j])
                 die("duplicate input type (%s and %s are both %s)",
                     argv[2+i], argv[2+j],
-                    types[i] == FT_PDF ? "PDF" :
-                    types[i] == FT_JPEG ? "JPEG" : "ZIP");
+                    types[i] == FT_PDF  ? "PDF"  :
+                    types[i] == FT_JPEG ? "JPEG" :
+                    types[i] == FT_ZIP  ? "ZIP"  : "ELF");
 
-    File *pdf = NULL, *jpeg = NULL, *zip = NULL;
+    File *pdf = NULL, *jpeg = NULL, *zip = NULL, *elf = NULL;
     for (int i = 0; i < ninputs; i++) {
         if (types[i] == FT_PDF)  pdf  = &inputs[i];
         if (types[i] == FT_JPEG) jpeg = &inputs[i];
         if (types[i] == FT_ZIP)  zip  = &inputs[i];
+        if (types[i] == FT_ELF)  elf  = &inputs[i];
     }
+
+    if (elf && jpeg)
+        die("ELF and JPEG cannot be combined (both require specific magic at byte 0)");
 
     Buf out; buf_init(&out);
 
     if      (jpeg && pdf && zip) out = combine_all(jpeg, pdf, zip);
+    else if (elf  && pdf && zip) out = combine_elf_pdf_zip(elf, pdf, zip);
     else if (jpeg && pdf)        out = combine_jpeg_pdf(jpeg, pdf);
     else if (jpeg && zip)        out = combine_jpeg_zip(jpeg, zip);
     else if (pdf  && zip)        out = combine_pdf_zip(pdf, zip);
-    else die("no supported combination (need pdf/jpeg/zip)");
+    else if (elf  && pdf)        out = combine_elf_pdf(elf, pdf);
+    else if (elf  && zip)        out = combine_elf_zip(elf, zip);
+    else die("no supported combination (need pdf/jpeg/zip/elf)");
 
     write_file(outpath, &out);
     printf("wrote %s (%zu bytes)\n", outpath, out.len);
