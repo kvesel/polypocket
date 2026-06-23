@@ -51,46 +51,24 @@ Provide 2–3 input files. Types are auto-detected from magic bytes (not file ex
 
 ## Exploitability matrix
 
-Known CVEs and in-the-wild campaigns that use the same structural techniques polypocket produces:
+Known CVEs and in-the-wild campaigns that use the same structural techniques polypocket produces.
 
-```
-┌──────────────┬────────────────────────────────┬─────────────────────┐
-│    Combo     │              CVE               │     In-wild use     │
-├──────────────┼────────────────────────────────┼─────────────────────┤
-│ PE + ZIP     │ CVE-2020-1464 / -1599 /        │ ZLoader, Batloader  │
-│              │ 2021-26413                     │                     │
-├──────────────┼────────────────────────────────┼─────────────────────┤
-│ GIF + ZIP    │ GIFAR (JRE 6 CVE)              │ SyncCrypt           │
-│              │                                │ ransomware          │
-├──────────────┼────────────────────────────────┼─────────────────────┤
-│ PDF + ZIP    │ None; MalDoc pattern           │ IcedID, Batloader   │
-├──────────────┼────────────────────────────────┼─────────────────────┤
-│ JPEG +       │ None; JPEG+PHP pattern         │ 2023 SaaS RCE       │
-│ ZIP/PDF      │                                │                     │
-├──────────────┼────────────────────────────────┼─────────────────────┤
-│ PNG + ZIP    │ Analogous to CVE-2019-11687    │ DarkTrack RAT       │
-├──────────────┼────────────────────────────────┼─────────────────────┤
-│ ELF + PDF    │ Analogous to CVE-2019-11687    │ PoC on medical      │
-│              │                                │ devices             │
-├──────────────┼────────────────────────────────┼─────────────────────┤
-│ MP3 + PDF    │ None found                     │ None documented     │
-├──────────────┼────────────────────────────────┼─────────────────────┤
-│ PS + PDF     │ None found                     │ None documented     │
-└──────────────┴────────────────────────────────┴─────────────────────┘
-```
+| Combo | CVE | In-wild use |
+|-------|-----|-------------|
+| PE + ZIP | CVE-2020-1464, CVE-2020-1599, CVE-2021-26413 | ZLoader, Batloader |
+| GIF + ZIP | GIFAR (JRE 6 CVE, 2008) | SyncCrypt ransomware |
+| PDF + ZIP | None; MalDoc-in-PDF pattern | IcedID, Batloader |
+| JPEG + ZIP/PDF | None; JPEG+PHP upload bypass pattern | 2023 SaaS RCE |
+| PNG + ZIP | Analogous to CVE-2019-11687 | DarkTrack RAT |
+| ELF + PDF | Analogous to CVE-2019-11687 | PoC on medical devices |
+| MP3 + PDF | None found | None documented |
+| PS + PDF | None found | None documented |
 
-**PE + ZIP** (CVE-2020-1464, CVSS 7.8, CISA KEV): `WinVerifyTrust` validates the
-PE/MSI prefix and ignores the appended ZIP, allowing a legitimately-signed PE to
-carry a malicious JAR/ZIP payload executed by a second runtime.
+**CVE-2020-1464 "GlueBall"** (CVSS 7.8, CISA KEV): `WinVerifyTrust` validates the PE/MSI prefix and ignores the appended ZIP, so a legitimately-signed PE can carry a malicious JAR payload executed by a second runtime. CVE-2020-1599 and CVE-2021-26413 are related Authenticode/MSI signing bypass variants in the same family.
 
-**GIF + ZIP** (GIFAR): GIF header at the front, JAR/ZIP index at the back — used to
-bypass Java applet same-origin policy. SyncCrypt ransomware (2017) applied the same
-technique with JPEG+ZIP.
+**GIFAR**: GIF header at the front, JAR/ZIP index at the back — used to bypass the Java applet same-origin policy. SyncCrypt ransomware (2017) and DarkTrack RAT applied the same technique with JPEG+ZIP and PNG+ZIP respectively.
 
-**CVE-2019-11687** (DICOM preamble): the DICOM spec reserves a 128-byte preamble
-for arbitrary content; researchers embedded full PE/ELF headers there, making a file
-that displays as a medical image and executes as a binary. Analogous to polypocket's
-ELF ident padding and PNG tEXt chunk injection.
+**CVE-2019-11687** (DICOM preamble): the DICOM spec reserves a 128-byte preamble for arbitrary content; researchers embedded full PE or ELF headers there (PEDICOM/ELFDICOM), producing a file that displays as a medical image and executes as a binary. Structurally analogous to polypocket's ELF ident padding ([8..15]) and PNG tEXt chunk injection techniques.
 
 ## Limitations
 
