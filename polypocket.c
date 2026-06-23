@@ -27,7 +27,7 @@ static void die(const char *fmt, ...) {
     exit(1);
 }
 
-typedef enum { FT_PDF, FT_JPEG, FT_ZIP, FT_ELF } FileType;
+typedef enum { FT_PDF, FT_JPEG, FT_ZIP, FT_ELF, FT_PNG, FT_PE } FileType;
 
 typedef struct { uint8_t *data; size_t size; } File;
 
@@ -68,11 +68,20 @@ static uint32_t r32le(const uint8_t *p) {
 static void w32le(uint8_t *p, uint32_t v) {
     p[0] = v; p[1] = v>>8; p[2] = v>>16; p[3] = v>>24;
 }
+static uint64_t r64le(const uint8_t *p) {
+    return (uint64_t)r32le(p) | ((uint64_t)r32le(p + 4) << 32);
+}
+static void w64le(uint8_t *p, uint64_t v) {
+    w32le(p, (uint32_t)v); w32le(p + 4, (uint32_t)(v >> 32));
+}
 static uint16_t r16be(const uint8_t *p) {
     return (uint16_t)((p[0] << 8) | p[1]);
 }
 static void w16be(uint8_t *p, uint16_t v) {
     p[0] = (uint8_t)(v >> 8); p[1] = (uint8_t)v;
+}
+static void w32be(uint8_t *p, uint32_t v) {
+    p[0]=(uint8_t)(v>>24); p[1]=(uint8_t)(v>>16); p[2]=(uint8_t)(v>>8); p[3]=(uint8_t)v;
 }
 
 /* write exactly 10 ASCII decimal digits into dst (no null terminator) */
@@ -115,6 +124,10 @@ static FileType detect_type(const File *f, const char *name) {
         return FT_ZIP;
     if (f->size >= 4 && memcmp(f->data, "\x7f" "ELF", 4) == 0)
         return FT_ELF;
+    if (f->size >= 2 && f->data[0] == 'M' && f->data[1] == 'Z')
+        return FT_PE;
+    if (f->size >= 8 && memcmp(f->data, "\x89PNG\r\n\x1a\n", 8) == 0)
+        return FT_PNG;
     size_t scan = f->size < 1024 ? f->size : 1024;
     for (size_t i = 0; i + 4 <= scan; i++)
         if (memcmp(f->data + i, "%PDF", 4) == 0) return FT_PDF;
@@ -147,46 +160,128 @@ static size_t find_eocd(const uint8_t *data, size_t size) {
 }
 
 /*
- * Return a new Buf containing the ZIP data with all local-header
- * offsets shifted up by `delta` bytes (to account for data prepended
- * in the output file before the ZIP block).
+ * Scan the extra field block for the Zip64 extended-info block (ID 0x0001)
+ * and add `delta` to its local-header-offset subfield.
+ *
+ * usz32 / csz32 are the 32-bit sizes from the CD entry: when they equal
+ * 0xFFFFFFFF the 64-bit values precede the offset inside the Zip64 block,
+ * so we must skip them to find the right position.
+ */
+static void zip64_patch_lhoff(uint8_t *extra, uint16_t ex_len,
+                               uint32_t usz32, uint32_t csz32, uint64_t delta) {
+    size_t p = 0;
+    while (p + 4 <= (size_t)ex_len) {
+        uint16_t id  = r16le(extra + p);
+        uint16_t dsz = r16le(extra + p + 2);
+        if (id == 0x0001) {
+            size_t fp = 4;                          /* offset from block start */
+            if (usz32 == 0xFFFFFFFFu) fp += 8;     /* skip original size      */
+            if (csz32 == 0xFFFFFFFFu) fp += 8;     /* skip compressed size    */
+            if (fp + 8 > (size_t)4 + dsz)
+                die("ZIP: Zip64 extra field too small to hold local header offset");
+            w64le(extra + p + fp, r64le(extra + p + fp) + delta);
+            return;
+        }
+        p += 4u + dsz;
+    }
+    die("ZIP: Zip64 extra field (0x0001) not found for entry with sentinel offset");
+}
+
+/*
+ * Return a new Buf containing the ZIP data with all local-header offsets
+ * shifted up by `delta` bytes.  Handles both standard (32-bit) and Zip64
+ * archives transparently.
+ *
+ * Zip64 detection: look for the EOCD64 locator (PK\x06\x07) in the 20
+ * bytes immediately before the EOCD, then follow its pointer to the EOCD64
+ * record (PK\x06\x06) which carries the true 64-bit CD size and offset.
  */
 static Buf zip_with_delta(const File *zip, size_t delta) {
-    size_t eocd_off   = find_eocd(zip->data, zip->size);
-    uint32_t cd_size  = r32le(zip->data + eocd_off + 12);
-    uint32_t cd_off   = r32le(zip->data + eocd_off + 16);
-    uint16_t cmt_len  = r16le(zip->data + eocd_off + 20);
+    size_t eocd_off  = find_eocd(zip->data, zip->size);
+    uint16_t cmt_len = r16le(zip->data + eocd_off + 20);
 
-    Buf out;
-    buf_init(&out);
+    /* ── Zip64 detection ── */
+    int    is_zip64     = 0;
+    size_t eocd64_off   = 0;
+    size_t eocd64_total = 0;
+    uint64_t cd_size64  = 0, cd_off64 = 0;
+
+    if (eocd_off >= 20 &&
+        memcmp(zip->data + eocd_off - 20, "PK\x06\x07", 4) == 0) {
+        const uint8_t *loc = zip->data + eocd_off - 20;
+        eocd64_off = (size_t)r64le(loc + 8);
+        if (eocd64_off + 56 > zip->size ||
+            memcmp(zip->data + eocd64_off, "PK\x06\x06", 4) != 0)
+            die("ZIP: Zip64 EOCD record not found at offset from locator");
+        is_zip64     = 1;
+        eocd64_total = (size_t)(12 + r64le(zip->data + eocd64_off + 4));
+        cd_size64    = r64le(zip->data + eocd64_off + 40);
+        cd_off64     = r64le(zip->data + eocd64_off + 48);
+    }
+
+    size_t actual_cd_off  = is_zip64 ? (size_t)cd_off64
+                                     : (size_t)r32le(zip->data + eocd_off + 16);
+    size_t actual_cd_size = is_zip64 ? (size_t)cd_size64
+                                     : (size_t)r32le(zip->data + eocd_off + 12);
+
+    Buf out; buf_init(&out);
 
     /* local file entries — copy verbatim */
-    buf_append(&out, zip->data, (size_t)cd_off);
+    buf_append(&out, zip->data, actual_cd_off);
 
-    /* rebuild central directory entries with patched local-header offsets */
+    /* rebuild central directory with patched local-header offsets */
     size_t cd_start = out.len;
-    const uint8_t *cd = zip->data + cd_off;
+    const uint8_t *cd = zip->data + actual_cd_off;
     size_t pos = 0;
-    while (pos + 4 <= (size_t)cd_size &&
+    while (pos + 4 <= actual_cd_size &&
            memcmp(cd + pos, "PK\x01\x02", 4) == 0) {
         uint16_t fn = r16le(cd + pos + 28);
         uint16_t ex = r16le(cd + pos + 30);
         uint16_t cm = r16le(cd + pos + 32);
         size_t   es = 46u + fn + ex + cm;
-        size_t   wo = out.len;        /* write offset of this entry */
+        size_t   wo = out.len;
         buf_append(&out, cd + pos, es);
-        /* patch local-header offset field at +42 within the entry */
-        uint32_t new_off = r32le(cd + pos + 42) + (uint32_t)delta;
-        w32le(out.data + wo + 42, new_off);
+
+        uint32_t lhoff32 = r32le(cd + pos + 42);
+        if (lhoff32 == 0xFFFFFFFFu) {
+            /* Zip64: patch the 64-bit offset inside the Zip64 extra field */
+            zip64_patch_lhoff(out.data + wo + 46 + fn, ex,
+                              r32le(cd + pos + 24),   /* uncompressed size */
+                              r32le(cd + pos + 20),   /* compressed size   */
+                              (uint64_t)delta);
+        } else {
+            w32le(out.data + wo + 42, lhoff32 + (uint32_t)delta);
+        }
         pos += es;
     }
 
-    /* rebuild EOCD */
-    uint8_t eocd[22];
-    memcpy(eocd, zip->data + eocd_off, 22);
-    w32le(eocd + 12, (uint32_t)(out.len - cd_start)); /* new cd size  */
-    w32le(eocd + 16, (uint32_t)(cd_start + delta));   /* new cd offset in output file */
-    buf_append(&out, eocd, 22);
+    size_t new_cd_size = out.len - cd_start;
+
+    if (is_zip64) {
+        /* EOCD64: copy verbatim, then patch cd_size and cd_off */
+        size_t eocd64_pos = out.len;
+        buf_append(&out, zip->data + eocd64_off, eocd64_total);
+        w64le(out.data + eocd64_pos + 40, (uint64_t)new_cd_size);
+        w64le(out.data + eocd64_pos + 48, (uint64_t)(cd_start + delta));
+
+        /* EOCD64 locator: copy and patch the EOCD64 file offset */
+        uint8_t loc[20];
+        memcpy(loc, zip->data + eocd_off - 20, 20);
+        w64le(loc + 8, (uint64_t)(eocd64_pos + delta));
+        buf_append(&out, loc, 20);
+
+        /* EOCD: keep verbatim — sentinel 0xFFFFFFFF values stay correct */
+        buf_append(&out, zip->data + eocd_off, 22);
+    } else {
+        if ((uint64_t)(cd_start + delta) > 0xFFFFFFFFu)
+            die("ZIP: output exceeds 4 GiB; provide a Zip64 archive instead");
+        uint8_t eocd[22];
+        memcpy(eocd, zip->data + eocd_off, 22);
+        w32le(eocd + 12, (uint32_t)new_cd_size);
+        w32le(eocd + 16, (uint32_t)(cd_start + delta));
+        buf_append(&out, eocd, 22);
+    }
+
     if (cmt_len)
         buf_append(&out, zip->data + eocd_off + 22, cmt_len);
 
@@ -337,6 +432,101 @@ static Buf jpeg_inject_comment(const File *jpeg,
     return out;
 }
 
+/* ── PNG handling ───────────────────────────────────────────────── */
+
+/*
+ * Streaming CRC32 (ISO 3309 / ITU-T V.42, reflected polynomial 0xEDB88320).
+ * Used for PNG chunk CRC fields.
+ */
+static uint32_t crc32_update(uint32_t crc, const uint8_t *p, size_t n) {
+    for (size_t i = 0; i < n; i++) {
+        crc ^= p[i];
+        for (int j = 0; j < 8; j++)
+            crc = (crc >> 1) ^ ((crc & 1) ? 0xEDB88320u : 0u);
+    }
+    return crc;
+}
+
+/*
+ * Inject a tEXt chunk after IHDR carrying `text` (tlen bytes).  The chunk
+ * uses keyword "X" so the PDF first line starting with "%PDF" falls within
+ * the first 1024 bytes where PDF parsers scan for the header.
+ *
+ * Chunk layout: 4-byte length | "tEXt" | "X\0" | text | 4-byte CRC.
+ * Fixed overhead = 4+4+2+4 = 14 bytes (the text payload is in addition).
+ */
+static Buf png_inject_text(const File *png, const uint8_t *text, size_t tlen) {
+    if (png->size < 33 || memcmp(png->data, "\x89PNG\r\n\x1a\n", 8) != 0)
+        die("PNG: invalid signature or file too small");
+    if (memcmp(png->data + 12, "IHDR", 4) != 0)
+        die("PNG: IHDR chunk not found at expected position");
+
+    static const uint8_t type[4] = {'t','E','X','t'};
+    static const uint8_t kw[2]   = {'X', 0};
+    uint32_t data_len = 2u + (uint32_t)tlen;
+
+    uint32_t crc = 0xFFFFFFFFu;
+    crc = crc32_update(crc, type, 4);
+    crc = crc32_update(crc, kw, 2);
+    crc = crc32_update(crc, text, tlen);
+    crc ^= 0xFFFFFFFFu;
+
+    Buf out; buf_init(&out);
+    uint8_t len_buf[4]; w32be(len_buf, data_len);
+    uint8_t crc_buf[4]; w32be(crc_buf, crc);
+    buf_append(&out, png->data, 33);   /* sig + IHDR chunk */
+    buf_append(&out, len_buf, 4);
+    buf_append(&out, type, 4);
+    buf_append(&out, kw, 2);
+    buf_append(&out, text, tlen);
+    buf_append(&out, crc_buf, 4);
+    buf_append(&out, png->data + 33, png->size - 33);
+    return out;
+}
+
+static Buf combine_png_zip(const File *png, const File *zip) {
+    Buf out; buf_init(&out);
+    buf_append(&out, png->data, png->size);
+    Buf zp = zip_with_delta(zip, png->size);
+    buf_append(&out, zp.data, zp.len);
+    buf_free(&zp);
+    return out;
+}
+
+static Buf combine_png_pdf(const File *png, const File *pdf) {
+    size_t M = 0;
+    while (M < pdf->size && pdf->data[M] != '\n') M++;
+    if (M < pdf->size) M++;
+    if (M < 5 || memcmp(pdf->data, "%PDF-", 5) != 0)
+        die("PDF: file does not start with %%PDF-");
+
+    /*
+     * tEXt chunk overhead = 14 bytes; M bytes embedded in chunk cancel the
+     * M bytes stripped from PDF, so delta = png->size + 14.
+     */
+    size_t delta = png->size + 14;
+
+    Buf pngmod = png_inject_text(png, pdf->data, M);
+    Buf pdfmod = pdf_with_delta(pdf, delta, M);
+    Buf out; buf_init(&out);
+    buf_append(&out, pngmod.data, pngmod.len);
+    buf_append(&out, pdfmod.data, pdfmod.len);
+    buf_free(&pngmod);
+    buf_free(&pdfmod);
+    return out;
+}
+
+static Buf combine_png_pdf_zip(const File *png, const File *pdf, const File *zip) {
+    Buf pp = combine_png_pdf(png, pdf);
+    Buf zp = zip_with_delta(zip, pp.len);
+    Buf out; buf_init(&out);
+    buf_append(&out, pp.data, pp.len);
+    buf_append(&out, zp.data, zp.len);
+    buf_free(&pp);
+    buf_free(&zp);
+    return out;
+}
+
 /* ── combination functions ──────────────────────────────────────── */
 
 static Buf combine_pdf_zip(const File *pdf, const File *zip) {
@@ -473,6 +663,70 @@ static Buf combine_elf_pdf_zip(const File *elf, const File *pdf, const File *zip
     return out;
 }
 
+/* ── PE/COFF combinations ───────────────────────────────────────── */
+
+/*
+ * PE+ZIP: the Windows loader maps only the sections listed in the section
+ * table and ignores any trailing bytes (the "overlay"), so ZIP appends
+ * cleanly just like it does after an ELF or JPEG.
+ */
+static Buf combine_pe_zip(const File *pe, const File *zip) {
+    Buf out; buf_init(&out);
+    buf_append(&out, pe->data, pe->size);
+    Buf zp = zip_with_delta(zip, pe->size);
+    buf_append(&out, zp.data, zp.len);
+    buf_free(&zp);
+    return out;
+}
+
+/*
+ * PE+PDF: smuggle %PDF into the MZ reserved field e_res2 at offset 0x28.
+ *
+ * The DOS/MZ header has 20 bytes of reserved zeros at e_res2 (0x28–0x3B).
+ * The Windows PE loader only uses the MZ magic (0x00) and e_lfanew (0x3C),
+ * so bytes 0x28–0x2F are safe to overwrite with the first 8 bytes of the
+ * PDF header line (e.g. "%PDF-1.7"), placing %PDF within the first 64 bytes
+ * where all PDF parsers will find it.
+ *
+ * delta = pe->size - M  (same arithmetic as ELF+PDF).
+ */
+static Buf combine_pe_pdf(const File *pe, const File *pdf) {
+    if (pe->size < 0x40)
+        die("PE: file too small to contain MZ header reserved fields");
+    if (pdf->size < 5 || memcmp(pdf->data, "%PDF-", 5) != 0)
+        die("PDF: file does not start with %%PDF-");
+
+    size_t M = 0;
+    while (M < pdf->size && pdf->data[M] != '\n') M++;
+    if (M < pdf->size) M++;
+    if (M < 5)
+        die("PDF: header line too short");
+
+    size_t delta = pe->size - M;
+
+    Buf out; buf_init(&out);
+    buf_append(&out, pe->data, pe->size);
+    size_t patch = (M - 1) < 8 ? (M - 1) : 8;
+    memcpy(out.data + 0x28, pdf->data, patch);
+    if (patch < 8) memset(out.data + 0x28 + patch, 0, 8 - patch);
+
+    Buf pmod = pdf_with_delta(pdf, delta, M);
+    buf_append(&out, pmod.data, pmod.len);
+    buf_free(&pmod);
+    return out;
+}
+
+static Buf combine_pe_pdf_zip(const File *pe, const File *pdf, const File *zip) {
+    Buf ep = combine_pe_pdf(pe, pdf);
+    Buf zp = zip_with_delta(zip, ep.len);
+    Buf out; buf_init(&out);
+    buf_append(&out, ep.data, ep.len);
+    buf_append(&out, zp.data, zp.len);
+    buf_free(&ep);
+    buf_free(&zp);
+    return out;
+}
+
 /* ── main ───────────────────────────────────────────────────────── */
 
 int main(int argc, char *argv[]) {
@@ -480,8 +734,9 @@ int main(int argc, char *argv[]) {
         fprintf(stderr,
             "usage: polypocket <output> <file1> <file2> [file3]\n"
             "  builds a polyglot file valid in all supplied formats\n"
-            "  supported types: pdf, jpeg/jpg, zip, elf\n"
-            "  note: elf cannot be combined with jpeg (both require magic at byte 0)\n");
+            "  supported types: pdf, jpeg/jpg, zip, elf, png, pe/exe\n"
+            "  note: jpeg/elf/png/pe cannot be combined with each other\n"
+            "        (all require specific magic bytes at offset 0)\n");
         return 1;
     }
 
@@ -502,29 +757,41 @@ int main(int argc, char *argv[]) {
                     argv[2+i], argv[2+j],
                     types[i] == FT_PDF  ? "PDF"  :
                     types[i] == FT_JPEG ? "JPEG" :
-                    types[i] == FT_ZIP  ? "ZIP"  : "ELF");
+                    types[i] == FT_ZIP  ? "ZIP"  :
+                    types[i] == FT_ELF  ? "ELF"  :
+                    types[i] == FT_PNG  ? "PNG"  : "PE");
 
-    File *pdf = NULL, *jpeg = NULL, *zip = NULL, *elf = NULL;
+    File *pdf = NULL, *jpeg = NULL, *zip = NULL, *elf = NULL, *png = NULL, *pe = NULL;
     for (int i = 0; i < ninputs; i++) {
         if (types[i] == FT_PDF)  pdf  = &inputs[i];
         if (types[i] == FT_JPEG) jpeg = &inputs[i];
         if (types[i] == FT_ZIP)  zip  = &inputs[i];
         if (types[i] == FT_ELF)  elf  = &inputs[i];
+        if (types[i] == FT_PNG)  png  = &inputs[i];
+        if (types[i] == FT_PE)   pe   = &inputs[i];
     }
 
-    if (elf && jpeg)
-        die("ELF and JPEG cannot be combined (both require specific magic at byte 0)");
+    /* jpeg, elf, png, pe all require specific magic at byte 0 — only one allowed */
+    if ((!!jpeg + !!elf + !!png + !!pe) > 1)
+        die("cannot combine jpeg/elf/png/pe with each other "
+            "(all require specific magic bytes at offset 0)");
 
     Buf out; buf_init(&out);
 
     if      (jpeg && pdf && zip) out = combine_jpeg_pdf_zip(jpeg, pdf, zip);
     else if (elf  && pdf && zip) out = combine_elf_pdf_zip(elf, pdf, zip);
+    else if (png  && pdf && zip) out = combine_png_pdf_zip(png, pdf, zip);
+    else if (pe   && pdf && zip) out = combine_pe_pdf_zip(pe, pdf, zip);
     else if (jpeg && pdf)        out = combine_jpeg_pdf(jpeg, pdf);
     else if (jpeg && zip)        out = combine_jpeg_zip(jpeg, zip);
     else if (pdf  && zip)        out = combine_pdf_zip(pdf, zip);
     else if (elf  && pdf)        out = combine_elf_pdf(elf, pdf);
     else if (elf  && zip)        out = combine_elf_zip(elf, zip);
-    else die("no supported combination (need pdf/jpeg/zip/elf)");
+    else if (png  && pdf)        out = combine_png_pdf(png, pdf);
+    else if (png  && zip)        out = combine_png_zip(png, zip);
+    else if (pe   && pdf)        out = combine_pe_pdf(pe, pdf);
+    else if (pe   && zip)        out = combine_pe_zip(pe, zip);
+    else die("no supported combination (need pdf/jpeg/zip/elf/png/pe)");
 
     write_file(outpath, &out);
     printf("wrote %s (%zu bytes)\n", outpath, out.len);
