@@ -1,11 +1,11 @@
 /*
- * polypocket.c — polyglot file builder for PDF, JPEG, ZIP, and ELF
+ * polypocket.c — polyglot file builder
  *
  * Usage: polypocket output input1 input2 [input3]
  * Builds a single output file that is simultaneously valid in all
- * supplied formats (any combination of pdf/jpeg/zip/elf).
+ * supplied formats.
  *
- * Compile: cc -O2 -o polypocket polypocket.c
+ * Compile: gcc polypocket.c -o polypocket
  */
 
 #include <stdio.h>
@@ -27,7 +27,7 @@ static void die(const char *fmt, ...) {
     exit(1);
 }
 
-typedef enum { FT_PDF, FT_JPEG, FT_ZIP, FT_ELF, FT_PNG, FT_PE } FileType;
+typedef enum { FT_PDF, FT_JPEG, FT_ZIP, FT_ELF, FT_PNG, FT_PE, FT_GIF, FT_MP3, FT_PS } FileType;
 
 typedef struct { uint8_t *data; size_t size; } File;
 
@@ -128,6 +128,13 @@ static FileType detect_type(const File *f, const char *name) {
         return FT_PE;
     if (f->size >= 8 && memcmp(f->data, "\x89PNG\r\n\x1a\n", 8) == 0)
         return FT_PNG;
+    if (f->size >= 6 && memcmp(f->data, "GIF8", 4) == 0 &&
+        (f->data[4] == '7' || f->data[4] == '9') && f->data[5] == 'a')
+        return FT_GIF;
+    if (f->size >= 3 && memcmp(f->data, "ID3", 3) == 0)
+        return FT_MP3;
+    if (f->size >= 2 && f->data[0] == '%' && f->data[1] == '!')
+        return FT_PS;
     size_t scan = f->size < 1024 ? f->size : 1024;
     for (size_t i = 0; i + 4 <= scan; i++)
         if (memcmp(f->data + i, "%PDF", 4) == 0) return FT_PDF;
@@ -527,6 +534,253 @@ static Buf combine_png_pdf_zip(const File *png, const File *pdf, const File *zip
     return out;
 }
 
+/* ── GIF handling ───────────────────────────────────────────────── */
+
+/*
+ * Inject a Comment Extension (0x21 0xFE) into the GIF immediately after
+ * the Logical Screen Descriptor and optional Global Color Table, carrying
+ * `text` (tlen bytes, max 255).  This places %PDF within the first 1024
+ * bytes so PDF parsers recognise the combined file.
+ *
+ * Comment layout: 0x21 0xFE | 1-byte sub-block length | text | 0x00
+ * Fixed overhead = 2+1+1 = 4 bytes (text payload is additional).
+ */
+static Buf gif_inject_comment(const File *gif, const uint8_t *text, size_t tlen) {
+    if (gif->size < 13)
+        die("GIF: file too small to contain header and LSD");
+    if (memcmp(gif->data, "GIF8", 4) != 0 ||
+        (gif->data[4] != '7' && gif->data[4] != '9') || gif->data[5] != 'a')
+        die("GIF: invalid header signature");
+    if (tlen > 255)
+        die("GIF: comment text too large (%zu bytes, max 255)", tlen);
+
+    /* skip Global Color Table if present (bit 7 of packed field at byte 10) */
+    size_t gct_size = 0;
+    if (gif->data[10] & 0x80)
+        gct_size = 3u << ((gif->data[10] & 0x07) + 1);  /* 3 * 2^(n+1) */
+
+    size_t inject_at = 13 + gct_size;
+    if (inject_at > gif->size)
+        die("GIF: Global Color Table extends beyond end of file");
+
+    Buf out; buf_init(&out);
+    buf_append(&out, gif->data, inject_at);
+    uint8_t hdr[3] = {0x21, 0xFE, (uint8_t)tlen};
+    buf_append(&out, hdr, 3);
+    buf_append(&out, text, tlen);
+    uint8_t term = 0x00;
+    buf_append(&out, &term, 1);
+    buf_append(&out, gif->data + inject_at, gif->size - inject_at);
+    return out;
+}
+
+static Buf combine_gif_zip(const File *gif, const File *zip) {
+    Buf out; buf_init(&out);
+    buf_append(&out, gif->data, gif->size);
+    Buf zp = zip_with_delta(zip, gif->size);
+    buf_append(&out, zp.data, zp.len);
+    buf_free(&zp);
+    return out;
+}
+
+static Buf combine_gif_pdf(const File *gif, const File *pdf) {
+    size_t M = 0;
+    while (M < pdf->size && pdf->data[M] != '\n') M++;
+    if (M < pdf->size) M++;
+    if (M < 5 || memcmp(pdf->data, "%PDF-", 5) != 0)
+        die("PDF: file does not start with %%PDF-");
+
+    /* comment overhead = 4 bytes; M bytes in comment cancel M bytes stripped */
+    size_t delta = gif->size + 4;
+
+    Buf gifmod = gif_inject_comment(gif, pdf->data, M);
+    Buf pdfmod = pdf_with_delta(pdf, delta, M);
+    Buf out; buf_init(&out);
+    buf_append(&out, gifmod.data, gifmod.len);
+    buf_append(&out, pdfmod.data, pdfmod.len);
+    buf_free(&gifmod);
+    buf_free(&pdfmod);
+    return out;
+}
+
+static Buf combine_gif_pdf_zip(const File *gif, const File *pdf, const File *zip) {
+    Buf gp = combine_gif_pdf(gif, pdf);
+    Buf zp = zip_with_delta(zip, gp.len);
+    Buf out; buf_init(&out);
+    buf_append(&out, gp.data, gp.len);
+    buf_append(&out, zp.data, zp.len);
+    buf_free(&gp);
+    buf_free(&zp);
+    return out;
+}
+
+/* ── MP3/ID3v2 handling ─────────────────────────────────────────── */
+
+static uint32_t id3_decode_syncsafe(const uint8_t *p) {
+    return ((uint32_t)(p[0] & 0x7F) << 21) | ((uint32_t)(p[1] & 0x7F) << 14) |
+           ((uint32_t)(p[2] & 0x7F) <<  7) |  (uint32_t)(p[3] & 0x7F);
+}
+static void id3_encode_syncsafe(uint8_t *p, uint32_t v) {
+    if (v > 0x0FFFFFFFu) die("MP3: ID3v2 tag size exceeds syncsafe limit");
+    p[3] = v & 0x7F; v >>= 7; p[2] = v & 0x7F; v >>= 7;
+    p[1] = v & 0x7F; v >>= 7; p[0] = v & 0x7F;
+}
+
+/*
+ * Inject a TXXX frame into the ID3v2 tag carrying `text` (the PDF first
+ * line) so that %PDF appears near the start of the file where PDF parsers
+ * scan for the header.
+ *
+ * Frame layout: "TXXX" | size(4) | flags(2) | 0x00 (encoding) | 0x00 (desc) | text
+ * Fixed overhead = 10+2 = 12 bytes (text payload is additional).
+ *
+ * Only ID3v2.3 and ID3v2.4 are supported (the vast majority of MP3 files).
+ * Frame size encoding: big-endian for v2.3, syncsafe for v2.4.
+ */
+static Buf mp3_inject_txxx(const File *mp3, const uint8_t *text, size_t tlen) {
+    if (mp3->size < 10 || memcmp(mp3->data, "ID3", 3) != 0)
+        die("MP3: ID3v2 tag not found");
+
+    uint8_t major = mp3->data[3];
+    uint8_t flags = mp3->data[5];
+    if (major < 3 || major > 4)
+        die("MP3: unsupported ID3v2 version 2.%u (need 2.3 or 2.4)", (unsigned)major);
+    if (flags & 0x40) die("MP3: ID3v2 extended header is not supported");
+    if (major == 4 && (flags & 0x10)) die("MP3: ID3v2.4 footer is not supported");
+
+    uint32_t tag_size  = id3_decode_syncsafe(mp3->data + 6);
+    if (10u + (size_t)tag_size > mp3->size)
+        die("MP3: ID3v2 tag size exceeds file size");
+
+    uint32_t fc = (uint32_t)tlen + 2u;  /* encoding + null desc + text */
+    uint32_t ft = 10u + fc;             /* full frame size             */
+
+    Buf out; buf_init(&out);
+    buf_append(&out, mp3->data, 10);
+    id3_encode_syncsafe(out.data + 6, tag_size + ft);
+
+    uint8_t fhdr[10]; memcpy(fhdr, "TXXX", 4);
+    if (major == 4) id3_encode_syncsafe(fhdr + 4, fc);
+    else            w32be(fhdr + 4, fc);
+    fhdr[8] = fhdr[9] = 0x00;
+    buf_append(&out, fhdr, 10);
+
+    uint8_t enc_desc[2] = {0x00, 0x00};
+    buf_append(&out, enc_desc, 2);
+    buf_append(&out, text, tlen);
+    buf_append(&out, mp3->data + 10, tag_size);  /* original frames */
+    size_t audio = 10u + (size_t)tag_size;
+    if (audio < mp3->size)
+        buf_append(&out, mp3->data + audio, mp3->size - audio);
+    return out;
+}
+
+static Buf combine_mp3_zip(const File *mp3, const File *zip) {
+    Buf out; buf_init(&out);
+    buf_append(&out, mp3->data, mp3->size);
+    Buf zp = zip_with_delta(zip, mp3->size);
+    buf_append(&out, zp.data, zp.len);
+    buf_free(&zp);
+    return out;
+}
+
+static Buf combine_mp3_pdf(const File *mp3, const File *pdf) {
+    size_t M = 0;
+    while (M < pdf->size && pdf->data[M] != '\n') M++;
+    if (M < pdf->size) M++;
+    if (M < 5 || memcmp(pdf->data, "%PDF-", 5) != 0)
+        die("PDF: file does not start with %%PDF-");
+
+    /* TXXX frame overhead = 12 bytes; M bytes in frame cancel M stripped */
+    size_t delta = mp3->size + 12;
+
+    Buf mp3mod = mp3_inject_txxx(mp3, pdf->data, M);
+    Buf pdfmod = pdf_with_delta(pdf, delta, M);
+    Buf out; buf_init(&out);
+    buf_append(&out, mp3mod.data, mp3mod.len);
+    buf_append(&out, pdfmod.data, pdfmod.len);
+    buf_free(&mp3mod);
+    buf_free(&pdfmod);
+    return out;
+}
+
+static Buf combine_mp3_pdf_zip(const File *mp3, const File *pdf, const File *zip) {
+    Buf mp = combine_mp3_pdf(mp3, pdf);
+    Buf zp = zip_with_delta(zip, mp.len);
+    Buf out; buf_init(&out);
+    buf_append(&out, mp.data, mp.len);
+    buf_append(&out, zp.data, zp.len);
+    buf_free(&mp);
+    buf_free(&zp);
+    return out;
+}
+
+/* ── PostScript handling ─────────────────────────────────────────── */
+
+/*
+ * Inject `text` (the PDF first line, e.g. "%PDF-1.7\n") as a PostScript
+ * comment immediately after the first line of the PS file.  Because text
+ * already starts with '%', it is syntactically a valid PS comment with no
+ * additional framing — overhead is zero.
+ *
+ * Modified PS size = ps->size + M; PDF body starts at ps->size + M;
+ * object originally at offset O → ps->size + O, so delta = ps->size.
+ */
+static Buf ps_inject_comment(const File *ps, const uint8_t *text, size_t tlen) {
+    if (ps->size < 2 || ps->data[0] != '%' || ps->data[1] != '!')
+        die("PS: file does not begin with %%!");
+
+    size_t L = 0;
+    while (L < ps->size && ps->data[L] != '\n') L++;
+    if (L < ps->size) L++;
+
+    Buf out; buf_init(&out);
+    buf_append(&out, ps->data, L);
+    buf_append(&out, text, tlen);
+    buf_append(&out, ps->data + L, ps->size - L);
+    return out;
+}
+
+static Buf combine_ps_zip(const File *ps, const File *zip) {
+    Buf out; buf_init(&out);
+    buf_append(&out, ps->data, ps->size);
+    Buf zp = zip_with_delta(zip, ps->size);
+    buf_append(&out, zp.data, zp.len);
+    buf_free(&zp);
+    return out;
+}
+
+static Buf combine_ps_pdf(const File *ps, const File *pdf) {
+    size_t M = 0;
+    while (M < pdf->size && pdf->data[M] != '\n') M++;
+    if (M < pdf->size) M++;
+    if (M < 5 || memcmp(pdf->data, "%PDF-", 5) != 0)
+        die("PDF: file does not start with %%PDF-");
+
+    /* zero extra overhead; delta = ps->size */
+    size_t delta = ps->size;
+
+    Buf psmod = ps_inject_comment(ps, pdf->data, M);
+    Buf pdfmod = pdf_with_delta(pdf, delta, M);
+    Buf out; buf_init(&out);
+    buf_append(&out, psmod.data, psmod.len);
+    buf_append(&out, pdfmod.data, pdfmod.len);
+    buf_free(&psmod);
+    buf_free(&pdfmod);
+    return out;
+}
+
+static Buf combine_ps_pdf_zip(const File *ps, const File *pdf, const File *zip) {
+    Buf pp = combine_ps_pdf(ps, pdf);
+    Buf zp = zip_with_delta(zip, pp.len);
+    Buf out; buf_init(&out);
+    buf_append(&out, pp.data, pp.len);
+    buf_append(&out, zp.data, zp.len);
+    buf_free(&pp);
+    buf_free(&zp);
+    return out;
+}
+
 /* ── combination functions ──────────────────────────────────────── */
 
 static Buf combine_pdf_zip(const File *pdf, const File *zip) {
@@ -734,8 +988,8 @@ int main(int argc, char *argv[]) {
         fprintf(stderr,
             "usage: polypocket <output> <file1> <file2> [file3]\n"
             "  builds a polyglot file valid in all supplied formats\n"
-            "  supported types: pdf, jpeg/jpg, zip, elf, png, pe/exe\n"
-            "  note: jpeg/elf/png/pe cannot be combined with each other\n"
+            "  supported types: pdf, jpeg/jpg, zip, elf, png, pe/exe, gif, mp3, ps\n"
+            "  note: jpeg/elf/png/pe/gif/mp3/ps cannot be combined with each other\n"
             "        (all require specific magic bytes at offset 0)\n");
         return 1;
     }
@@ -759,9 +1013,13 @@ int main(int argc, char *argv[]) {
                     types[i] == FT_JPEG ? "JPEG" :
                     types[i] == FT_ZIP  ? "ZIP"  :
                     types[i] == FT_ELF  ? "ELF"  :
-                    types[i] == FT_PNG  ? "PNG"  : "PE");
+                    types[i] == FT_PNG  ? "PNG"  :
+                    types[i] == FT_PE   ? "PE"   :
+                    types[i] == FT_GIF  ? "GIF"  :
+                    types[i] == FT_MP3  ? "MP3"  : "PS");
 
-    File *pdf = NULL, *jpeg = NULL, *zip = NULL, *elf = NULL, *png = NULL, *pe = NULL;
+    File *pdf = NULL, *jpeg = NULL, *zip = NULL, *elf = NULL;
+    File *png = NULL, *pe = NULL, *gif = NULL, *mp3 = NULL, *ps = NULL;
     for (int i = 0; i < ninputs; i++) {
         if (types[i] == FT_PDF)  pdf  = &inputs[i];
         if (types[i] == FT_JPEG) jpeg = &inputs[i];
@@ -769,11 +1027,14 @@ int main(int argc, char *argv[]) {
         if (types[i] == FT_ELF)  elf  = &inputs[i];
         if (types[i] == FT_PNG)  png  = &inputs[i];
         if (types[i] == FT_PE)   pe   = &inputs[i];
+        if (types[i] == FT_GIF)  gif  = &inputs[i];
+        if (types[i] == FT_MP3)  mp3  = &inputs[i];
+        if (types[i] == FT_PS)   ps   = &inputs[i];
     }
 
-    /* jpeg, elf, png, pe all require specific magic at byte 0 — only one allowed */
-    if ((!!jpeg + !!elf + !!png + !!pe) > 1)
-        die("cannot combine jpeg/elf/png/pe with each other "
+    /* jpeg/elf/png/pe/gif/mp3/ps all need specific magic at byte 0 — only one allowed */
+    if ((!!jpeg + !!elf + !!png + !!pe + !!gif + !!mp3 + !!ps) > 1)
+        die("cannot combine jpeg/elf/png/pe/gif/mp3/ps with each other "
             "(all require specific magic bytes at offset 0)");
 
     Buf out; buf_init(&out);
@@ -782,6 +1043,9 @@ int main(int argc, char *argv[]) {
     else if (elf  && pdf && zip) out = combine_elf_pdf_zip(elf, pdf, zip);
     else if (png  && pdf && zip) out = combine_png_pdf_zip(png, pdf, zip);
     else if (pe   && pdf && zip) out = combine_pe_pdf_zip(pe, pdf, zip);
+    else if (gif  && pdf && zip) out = combine_gif_pdf_zip(gif, pdf, zip);
+    else if (mp3  && pdf && zip) out = combine_mp3_pdf_zip(mp3, pdf, zip);
+    else if (ps   && pdf && zip) out = combine_ps_pdf_zip(ps, pdf, zip);
     else if (jpeg && pdf)        out = combine_jpeg_pdf(jpeg, pdf);
     else if (jpeg && zip)        out = combine_jpeg_zip(jpeg, zip);
     else if (pdf  && zip)        out = combine_pdf_zip(pdf, zip);
@@ -791,7 +1055,13 @@ int main(int argc, char *argv[]) {
     else if (png  && zip)        out = combine_png_zip(png, zip);
     else if (pe   && pdf)        out = combine_pe_pdf(pe, pdf);
     else if (pe   && zip)        out = combine_pe_zip(pe, zip);
-    else die("no supported combination (need pdf/jpeg/zip/elf/png/pe)");
+    else if (gif  && pdf)        out = combine_gif_pdf(gif, pdf);
+    else if (gif  && zip)        out = combine_gif_zip(gif, zip);
+    else if (mp3  && pdf)        out = combine_mp3_pdf(mp3, pdf);
+    else if (mp3  && zip)        out = combine_mp3_zip(mp3, zip);
+    else if (ps   && pdf)        out = combine_ps_pdf(ps, pdf);
+    else if (ps   && zip)        out = combine_ps_zip(ps, zip);
+    else die("no supported combination (need pdf/jpeg/zip/elf/png/pe/gif/mp3/ps)");
 
     write_file(outpath, &out);
     printf("wrote %s (%zu bytes)\n", outpath, out.len);
