@@ -393,7 +393,7 @@ static Buf combine_jpeg_pdf(const File *jpeg, const File *pdf) {
     return out;
 }
 
-static Buf combine_all(const File *jpeg, const File *pdf, const File *zip) {
+static Buf combine_jpeg_pdf_zip(const File *jpeg, const File *pdf, const File *zip) {
     Buf jp = combine_jpeg_pdf(jpeg, pdf);
     Buf zp = zip_with_delta(zip, jp.len);
     Buf out; buf_init(&out);
@@ -517,7 +517,7 @@ int main(int argc, char *argv[]) {
 
     Buf out; buf_init(&out);
 
-    if      (jpeg && pdf && zip) out = combine_all(jpeg, pdf, zip);
+    if      (jpeg && pdf && zip) out = combine_jpeg_pdf_zip(jpeg, pdf, zip);
     else if (elf  && pdf && zip) out = combine_elf_pdf_zip(elf, pdf, zip);
     else if (jpeg && pdf)        out = combine_jpeg_pdf(jpeg, pdf);
     else if (jpeg && zip)        out = combine_jpeg_zip(jpeg, zip);
