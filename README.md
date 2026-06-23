@@ -1,6 +1,6 @@
 # polypocket
 
-Combine PDF, JPEG, ZIP, PNG, GIF, EXE, PostScript, MP3 and/or ELF files into a single polyglot file that is simultaneously valid in all provided formats. Pass it to a PDF reader, an image viewer, `unzip`, or run it directly — each tool sees its own format.
+Combine PDF, JPEG, ZIP, JAR, PNG, GIF, EXE, PostScript, MP3 and/or ELF files into a single polyglot file that is simultaneously valid in all provided formats. Pass it to a PDF reader, an image viewer, `unzip`, or run it directly — each tool sees its own format.
 
 ## Build
 
